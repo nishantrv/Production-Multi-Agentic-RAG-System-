@@ -385,8 +385,8 @@ graph LR
     DeployU --> Stable
 ```
 
-- **[`.github/workflows/ci.yml`](.github/workflows/ci.yml)** — runs on pushes and PRs to `main`, `features`, `deployment`: `ruff check`, `ruff format --check`, then `pytest tests/` with dummy credentials.
-- **[`.github/workflows/cd.yml`](.github/workflows/cd.yml)** — triggered by a **successful CI run** on `main` or `deployment`. Logs in to ECR, builds and pushes the image tagged with the commit SHA and `latest`, renders the task definitions, then deploys `rag-api` and `rag-ui` and waits for each service to stabilize.
+- **`.github/workflows/ci.yml`** — runs on pushes and PRs to `main`, `features`, `deployment`: `ruff check`, `ruff format --check`, then `pytest tests/` with dummy credentials.
+- **`.github/workflows/cd.yml`** — triggered by a **successful CI run** on `main` or `deployment`. Logs in to ECR, builds and pushes the image tagged with the commit SHA and `latest`, renders the task definitions, then deploys `rag-api` and `rag-ui` and waits for each service to stabilize.
 
 #### Required GitHub Actions secrets
 
