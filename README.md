@@ -1,235 +1,523 @@
-<div align="center">
+# Enterprise Agentic RAG (Production, Scalable Pipeline)
 
-# 🤖 Production Multi-Agentic RAG System
+A production-grade, enterprise-level RAG system built with **LangGraph**, **Portkey LLM Gateway**, **OpenAI**, and **Jina AI Embeddings/Reranker**. The system distinguishes between technical "True Data" and random "Noisy Data" using semantic re-ranking, history-aware planning, and NeMo Guardrails for input/output safety.
 
-### An enterprise IT assistant that is guarded, plans before it searches, and is measured
+It ships with everything needed to run it for real: a hardened container image, a `docker compose` stack for local validation, GitHub Actions CI/CD, and a full **AWS ECS Fargate** deployment behind an Application Load Balancer with auto-scaling, Secrets Manager, and CloudWatch.
 
-**Ask about Kubernetes, Intel hardware or networking. Get an answer built from your own documents, with the sources and the agent's reasoning steps.**
-
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/API-FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![LangGraph](https://img.shields.io/badge/agents-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
-[![NeMo Guardrails](https://img.shields.io/badge/guardrails-NeMo-76B900?logo=nvidia&logoColor=white)](https://github.com/NVIDIA/NeMo-Guardrails)
-[![Qdrant](https://img.shields.io/badge/vector%20DB-Qdrant-DC244C)](https://qdrant.tech/)
-[![Portkey](https://img.shields.io/badge/gateway-Portkey-6E56CF)](https://portkey.ai/)
-[![RAGAS](https://img.shields.io/badge/evals-RAGAS-F59E0B)](https://docs.ragas.io/)
-[![Logfire](https://img.shields.io/badge/tracing-Logfire-E520E9)](https://pydantic.dev/logfire)
-[![Streamlit](https://img.shields.io/badge/UI-Streamlit-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
-[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
-
-[How it works](#-how-it-works) · [Quick start](#-quick-start) · [Evaluation](#-evaluation) · [API](#-api) · [Roadmap](#-roadmap)
-
-</div>
+| | |
+|---|---|
+| **Runtime** | AWS ECS Fargate (`rag-api` + `rag-ui`), ALB ingress, private subnets + NAT |
+| **State** | Qdrant Cloud (vectors) · Neon Postgres (LangGraph checkpoints) · Upstash Redis (rate limits) |
+| **Pipeline** | GitHub Actions → Amazon ECR → ECS rolling deploy |
+| **Observability** | CloudWatch Logs/Metrics · Prometheus `/metrics` · Logfire · LangSmith |
 
 ---
 
-Most RAG demos are one prompt and one vector search. This system is built the way a production assistant must be. Every question passes a **safety gate** first. Then a **planner agent** decides whether a search is needed at all. A **retriever agent** searches in two stages, and a **responder agent** writes the answer through a **model gateway** that retries and falls back on its own. Every step is **traced**, and the whole pipeline is **scored** against a golden dataset.
+## Key Features
 
-## ✨ Highlights
+- **Agentic Intelligence**: LangGraph for cyclic reasoning, multi-step planning, and conversation memory.
+- **Guardrails**: NeMo Guardrails gate blocks off-topic, jailbreak, and injection inputs before any retrieval.
+- **LLM Gateway**: Portkey routes all LLM calls with automatic fallback between OpenAI and Anthropic via your configured Portkey virtual providers.
+- **Enterprise Search**: Qdrant Cloud for high-performance vector search + Jina AI Reranker API for semantic reranking.
+- **Jina AI Embeddings**: `jina-embeddings-v3` (1024-dim) via Jina API, with local `mxbai-embed-large-v1` fallback.
+- **Local Document Parsing**: PDF, HTML, TXT, DOCX, PPTX parsed entirely on-device — no external OCR service.
+- **Observability**: Full trace nesting with **Pydantic Logfire** and **LangSmith** across every agent node.
+- **Metrics**: Prometheus `/metrics` endpoint with custom RAG and guardrails counters.
+- **Synchronous `/query`**: The LangGraph pipeline runs directly inside the `/query` endpoint and returns the final answer.
+- **API Key & Rate Limiting**: Optional bearer-token auth and Redis-backed (or in-memory) rate limiting.
+- **Evaluation Suite**: RAGAS-powered eval pipeline (6 metrics) with a dedicated Streamlit demo app and a headless `evals/run_evals.py` script.
+- **Production Deployment**: Single hardened image, non-root container, ECS Fargate services, target-tracking auto-scaling, and a one-command teardown script.
 
-| 🛡️ Guarded at the door | 🧭 Plans before it searches | 🎯 Two-stage retrieval |
-|---|---|---|
-| NVIDIA **NeMo Guardrails** with Colang rules blocks jailbreaks and off-topic requests, and handles small talk, *before* any retrieval or model cost. | A **planner agent** reads the whole conversation and decides: answer from memory, or rewrite the question into a better search query. Memory is kept per `thread_id`. | **Qdrant** dense search brings back 15 candidates. A local **FlashRank** cross-encoder re-scores them and keeps the best 5. If the reranker fails, the Qdrant order is used, so the user still gets an answer. |
+---
 
-| 🔀 A gateway that does not give up | 📈 Observable end to end | 🧪 Measured, not guessed |
-|---|---|---|
-| **Portkey** routes the planner and responder calls to Llama 3.3 70B on Groq, retries on `429`/`503`, falls back to Llama 3.1 8B and caches answers. A cache hit is shown in the reasoning steps. | **Logfire** is set up before any other import, so every guardrail check, planner decision, search, rerank and model call is one span in a trace. LangSmith tracing is on by default too. | A **Streamlit eval dashboard** runs the golden dataset through the live API and scores it with **RAGAS**, tool correctness and a guardrail confusion matrix. |
-
-## 🧭 How it works
+## Agent Intelligence Flow
 
 ```mermaid
-flowchart LR
-    U(["👤 User"]) --> UI["💬 Streamlit chat<br/>ui/app.py"]
-    UI -- "POST /query" --> API["⚡ FastAPI<br/>app/main.py"]
-    API --> G{"🛡️ NeMo Guardrails<br/>jailbreak · off-topic<br/>small talk"}
-    G -- "rail fired" --> SAFE["🚫 Safe reply<br/>no retrieval, no model cost"]:::stop
-    G -- "clean" --> P
-    subgraph AGENTS["🧠 LangGraph agents · memory per thread_id"]
-        direction TB
-        P["🧭 Planner<br/>chat or search?"]:::agent
-        RT["🔍 Retriever<br/>Qdrant top 15<br/>→ FlashRank top 5"]:::agent
-        RS["✍️ Responder<br/>answer from context<br/>and history"]:::agent
-        P -- "technical" --> RT --> RS
-        P -- "conversational" --> RS
+graph TD
+    User((User)) --> UI[Streamlit UI]
+    UI --> API[FastAPI /query]
+    API --> Guard{NeMo Guardrails}
+    Guard -->|Blocked| UI
+    Guard -->|Pass| Planner{Planner Node}
+    Planner -->|Conversational| Responder[Responder Node]
+    Planner -->|Technical| Retriever[Retriever Node]
+    Retriever --> Reranker[Jina AI Reranker API]
+    Reranker --> Responder
+    Responder --> UI
+    Responder -.-> Memory[(LangGraph Checkpointer — Neon)]
+```
+
+---
+
+## Deployment Architecture
+
+```mermaid
+graph TD
+    Client((Internet)) --> ALB[Application Load Balancer<br/>public subnets]
+
+    subgraph VPC["AWS VPC — 2 Availability Zones"]
+        subgraph Public["Public subnets"]
+            ALB
+            NAT[NAT Gateway]
+        end
+        subgraph Private["Private subnets"]
+            API[ECS Fargate — rag-api<br/>uvicorn :8080<br/>1 vCPU / 2 GB · min 2 / max 10]
+            UIS[ECS Fargate — rag-ui<br/>streamlit :8501<br/>0.5 vCPU / 1 GB · min 1 / max 4]
+        end
     end
-    RS --> GW["🔀 Portkey gateway<br/>Llama 3.3 70B → 8B fallback<br/>retries · cache"]:::gateway
-    GW --> OUT(["✅ Answer + reasoning steps + sources"]):::ok
 
-    classDef agent fill:#e3f0fb,stroke:#3b82c4,color:#0b2f45
-    classDef gateway fill:#f1ebfa,stroke:#8b6cc7,color:#2e1f4d
-    classDef stop fill:#fde8e8,stroke:#c0392b,color:#5b1a13
-    classDef ok fill:#e6f6e8,stroke:#3f9a4c,color:#123d19
+    ALB -->|/ , /query, /health| API
+    ALB -->|/ui*| UIS
+    UIS --> API
+    API --> NAT
+    NAT --> Qdrant[(Qdrant Cloud<br/>vectors)]
+    NAT --> Neon[(Neon Postgres<br/>checkpoints)]
+    NAT --> Redis[(Upstash Redis<br/>rate limits)]
+    NAT --> LLM[Portkey Gateway<br/>OpenAI + Anthropic fallback]
+    NAT --> Jina[Jina AI<br/>embeddings + reranker]
+
+    API -. secrets .-> SM[AWS Secrets Manager]
+    API -. logs .-> CW[CloudWatch Logs<br/>/ecs/rag-api · /ecs/rag-ui]
 ```
 
-<sub>📈 Logfire traces every box above. The planner also calls the model through the Portkey gateway. `GET /graph` returns a live picture of the LangGraph.</sub>
+All stateful components live **outside** Fargate, so every ECS task is stateless and horizontally scalable. Both services run the **same image** from ECR — only the container command differs.
 
-**One question, step by step:**
+---
 
-1. **Guard.** NeMo Guardrails checks the message. If a rail fires (a jailbreak, an off-topic request, a greeting), the API returns the rail's reply at once, and retrieval is skipped.
-2. **Plan.** The planner reads the conversation history. A greeting, or a question the history can answer ("what is my name?"), goes straight to the responder. A technical question is rewritten into a sharper search query.
-3. **Retrieve.** The query is embedded and sent to Qdrant (top 15). FlashRank re-scores the candidates with a cross-encoder and keeps the top 5.
-4. **Respond.** The responder builds the prompt from the retrieved context (capped at 25,000 characters, to stay inside Groq's token limits) and the history. It calls the model through Portkey at temperature 0.1.
-5. **Return.** The API sends back the answer, the reasoning steps (`thought_process`), the status and the source chunks. The chat UI shows all of them.
+## Project Structure
 
-## 📥 Ingestion
-
-```mermaid
-flowchart LR
-    T["📂 DATA/true_data<br/>6 Kubernetes docs<br/>in 4 formats"] --> L
-    N["🗑️ DATA/noisy_data<br/>look-alike distractor docs"] --> L
-    L["📄 Loaders<br/>PDF · HTML · TXT<br/>DOCX · PPTX"] --> C["✂️ Chunker<br/>by paragraph<br/>≤ 1,500 chars"]
-    C --> J["💾 processed_data/<br/>JSON per file"]
-    C --> E["🧬 Embeddings<br/>Gemini 3072-d<br/>fallback MPNet 768-d"]
-    E --> Q[("🗄️ Qdrant<br/>cosine · tagged<br/>true / noisy")]
+```text
+├── app/
+│   ├── agents/
+│   │   └── nodes/       # Planner, Retriever, Responder LangGraph nodes
+│   ├── gateway/         # Portkey LLM gateway — primary + Anthropic fallback routing
+│   ├── guardrails/      # NeMo Guardrails input/output filtering
+│   ├── ingestion/
+│   │   ├── chunking/    # Paragraph-based text splitter (1500 char max)
+│   │   └── loaders/     # Local parsers — PDF (pypdf), HTML, TXT, DOCX, PPTX
+│   ├── services/
+│   │   ├── health/      # connection_checker — validates every external dependency
+│   │   └── retrieval/   # Jina AI embeddings + Qdrant search + Jina AI reranking
+│   ├── config.py        # Centralized environment variable management
+│   ├── health.py        # /health and /ready routes
+│   └── main.py          # FastAPI entrypoint — guardrails gate + /query endpoint
+├── evals/               # RAGAS evaluation suite + Streamlit 3-tab demo
+├── ui/                  # Streamlit chat interface with reasoning step transparency
+├── tests/               # pytest unit tests (run in CI)
+├── .aws/
+│   └── task-definitions/  # ECS Fargate task definitions (rag-api.json, rag-ui.json)
+├── .github/workflows/
+│   ├── ci.yml           # Lint (ruff) + unit tests (pytest)
+│   └── cd.yml           # Build → ECR push → ECS deploy
+├── scripts/             # AWS provisioning, secrets, teardown, and load-test helpers
+├── processed_data/      # Auto-generated — parsed & chunked JSON output per document
+├── DATA/                # Sample datasets (True vs Noisy documentation)
+├── Dockerfile           # Production image — uv install, non-root user, :8080
+├── docker-compose.yml   # Local full-stack validation (api + ui + qdrant)
+├── requirements.txt     # Full dev dependencies
+└── requirements-prod.txt  # Lean production dependency set
 ```
 
-- **Real documents and deliberate noise.** `DATA/true_data` holds the Kubernetes material (architecture, CronJobs, jobs, monitoring, work queues, pod autoscaling) as PPTX, DOCX, HTML and TXT. `DATA/noisy_data` holds distractor files with real-sounding titles and random content. They test that retrieval finds the right chunk inside a noisy index.
-- **Robust parsing.** PDFs are read with pypdf, and any page that comes back blank is retried with pdfplumber.
-- **Embeddings that do not block.** At start-up a probe call checks Gemini (`gemini-embedding-2-preview`, 3072 dimensions). If Gemini is not reachable, the system switches to a local `all-mpnet-base-v2` model (768 dimensions) and sizes the Qdrant collection to match. Batches of 50 retry with exponential backoff (1 → 2 → 4 → 8 s) on rate limits.
-- **Every chunk is tagged** with its source file and source type, so noise can be told apart from the real documents.
+---
 
-```bash
-python -m app.ingestion.processor DATA --wipe          # drop and rebuild the collection, then index everything
-python -m app.ingestion.processor DATA/true_data true  # index one folder with an explicit source type
-```
+## Tech Stack
 
-## 🧪 Evaluation
+| Layer | Technology |
+|-------|-----------|
+| Orchestration | LangChain + LangGraph |
+| LLMs | OpenAI `gpt-5-mini` + Anthropic fallback via **Portkey** gateway |
+| Guardrails | NeMo Guardrails |
+| Vector DB | Qdrant Cloud |
+| Reranking | Jina AI Reranker API (`jina-reranker-v3`) |
+| Embeddings | Jina AI `jina-embeddings-v3` (1024-dim) + local mxbai fallback |
+| Document Parsing | pypdf + pdfplumber (local, no OCR service) |
+| Conversation memory | Neon serverless PostgreSQL (LangGraph checkpointer) |
+| Rate limiting | Upstash Redis (in-memory fallback) |
+| Observability | Pydantic Logfire + LangSmith + Prometheus + CloudWatch |
+| Evaluation | RAGAS + custom Tool Correctness (Jaccard) |
+| Container | Docker (`python:3.11-slim-bookworm`, `uv`, non-root) |
+| Compute | AWS ECS on Fargate |
+| Ingress | AWS Application Load Balancer |
+| Registry | Amazon ECR |
+| Secrets | AWS Secrets Manager |
+| CI/CD | GitHub Actions |
+| Load testing | Locust |
 
-```mermaid
-flowchart LR
-    GD["📋 golden_dataset.json<br/>15 Q&A pairs · 5 topics<br/>6 guardrail cases"] --> LP["🚀 Live run<br/>every question<br/>through POST /query"]
-    LP --> RG["📊 RAGAS<br/>5 metrics"]
-    LP --> TC["🧰 Tool correctness<br/>no LLM needed"]
-    LP --> GR["🛡️ Guardrail tests<br/>TP · TN · FP · FN"]
-    RG --> DB["🧪 Streamlit eval dashboard"]
-    TC --> DB
-    GR --> DB
-```
+---
 
-The eval suite (`streamlit run evals/app.py`) runs in three tabs: **the ground truth**, **the live pipeline** and **the metrics**. It calls the real running API, so it measures the system a user actually talks to.
+## API Endpoints
 
-| Metric | The question it answers | How it is scored |
+| Method | Path | Purpose |
 |---|---|---|
-| Faithfulness | Is every claim in the answer supported by the retrieved context? | RAGAS, LLM judge |
-| Answer relevancy | Does the answer address the question that was asked? | RAGAS, LLM judge + embeddings |
-| Context precision | Are the retrieved chunks the relevant ones, ranked high? | RAGAS, against the reference answer |
-| Context recall | Did retrieval find everything the reference answer needs? | RAGAS, against the reference answer |
-| Answer correctness | Does the answer match the reference answer? | RAGAS, LLM judge + embeddings |
-| Tool correctness | Did the agent take the expected path (retrieve, answer directly, or block)? | Jaccard overlap, no LLM |
-| Guardrail accuracy | Are attacks blocked and real questions let through? | Precision, recall and accuracy over TP / TN / FP / FN |
+| `GET` | `/health` | Liveness probe — `{"status":"ok"}` |
+| `GET` | `/ready` | Readiness — checks Postgres, Redis, Qdrant, LLM gateway, Jina embeddings, Jina reranker |
+| `POST` | `/query` | Run the LangGraph RAG pipeline synchronously |
+| `GET` | `/graph` | Graph representation of the agent pipeline |
+| `GET` | `/metrics` | Prometheus metrics (RAG + guardrails counters) |
 
-<details>
-<summary><b>How the evals stay inside free-tier limits</b></summary>
+---
 
-- The judge is `llama-3.1-8b-instant` on Groq, through its **own key** (`JUDGE_GROQ`), so an eval run never uses up the production key.
-- RAGAS embeddings run locally (`all-MiniLM-L6-v2`).
-- Samples are scored one at a time, with 40 s cooldowns between samples and 62 s between metrics, calibrated for Groq's 6,000 tokens-per-minute tier. Contexts are cut to 2 chunks of 300 characters for the judge. A full run takes about 50 minutes.
+## Getting Started (Local)
 
-</details>
+### 1. Install dependencies
 
-## 🚀 Quick start
-
-```bash
-git clone https://github.com/nishantrv/Production-Multi-Agentic-RAG-System-.git
-cd Production-Multi-Agentic-RAG-System-
-python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
+```powershell
+python -m venv .venv
+.\.venv\Scripts\activate
 pip install -r requirements.txt
-
-python -m app.ingestion.processor DATA --wipe          # 1. index the documents into Qdrant
-uvicorn app.main:app --reload --port 8000              # 2. start the API  (docs at http://localhost:8000/docs)
-streamlit run ui/app.py                                # 3. chat with the assistant (new terminal)
-streamlit run evals/app.py                             # 4. run the evaluation dashboard (API must be running)
 ```
 
-<details>
-<summary><b>Settings (<code>.env</code> in the project root)</b></summary>
+### 2. Configure environment
 
-| Variable | Used for |
-|---|---|
-| `GROQ_API_KEY` | the guardrails model (Llama 3.3 70B) |
-| `PORTKEY_API_KEY` | the model gateway for the planner and the responder |
-| `GEMINI_API_KEY` | Gemini embeddings (optional; a local model is used without it) |
-| `QDRANT_CLUSTER_ENDPOINT`, `QDRANT_API_KEY` | the Qdrant vector database |
-| `LOGFIRE_TOKEN` | Logfire tracing |
-| `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`, `LANGSMITH_TRACING`, `LANGSMITH_ENDPOINT` | LangSmith tracing (optional) |
-| `JUDGE_GROQ` | a separate Groq key for the eval judge (falls back to `GROQ_API_KEY`) |
-| `BACKEND_URL` | where the chat UI finds the API (default `http://localhost:8000`) |
+Copy `.env.example` to `.env` and fill in your keys:
 
-**Portkey:** create two Groq integrations in the Portkey model catalog, with the slugs `rag` (primary, `llama-3.3-70b-versatile`) and `brag` (fallback, `llama-3.1-8b-instant`). The routing, retry and cache rules are in `app/gateway/client.py`.
+```powershell
+copy .env.example .env
+```
 
-</details>
+Key variables:
 
-## 🔌 API
+```env
+# OpenAI LLM
+OPENAI_API_KEY=
 
-| Method | Path | What it does |
-|---|---|---|
-| `GET` | `/` | health check |
-| `GET` | `/graph` | a PNG picture of the LangGraph agent workflow |
-| `POST` | `/query` | ask a question: `{"q": "...", "thread_id": "..."}` |
+# LLM Gateway (Portkey)
+PORTKEY_API_KEY=
+PORTKEY_PRIMARY_SLUG=marathon-api
+PORTKEY_PRIMARY_MODEL=gpt-5-mini
+PORTKEY_FALLBACK_SLUG=anthropic-fallback
+PORTKEY_PRIMARY_CONFIG_ID=      # system-generated pc-... ID of the saved Portkey config
+
+# Jina AI Embeddings + Reranker API
+JINA_API_KEY=
+
+# Vector DB
+QDRANT_API_KEY=
+QDRANT_CLUSTER_ENDPOINT=https://your-cluster.cloud.qdrant.io:6333
+
+# Production persistence (Neon) & cache (Upstash Redis)
+NEON_DB_URL=postgresql://user:password@host.neon.tech/enterprise_rag?sslmode=require
+UPSTASH_REDIS_REST_URL=https://your-db.upstash.io
+UPSTASH_REDIS_REST_TOKEN=your-upstash-token
+
+# API safety
+RAG_API_KEY=                    # set in production to require bearer auth
+RATE_LIMIT_PER_MINUTE=20
+
+# Observability
+LOGFIRE_TOKEN=
+LANGSMITH_API_KEY=
+LANGSMITH_PROJECT=enterprise_rag
+LANGSMITH_TRACING=true
+
+# Evals
+JUDGE_OPENAI_API_KEY=           # falls back to OPENAI_API_KEY
+
+# Backend (for Streamlit UI)
+BACKEND_URL=http://localhost:8000
+```
+
+> `PORTKEY_PRIMARY_CONFIG_ID` must be the system-generated `pc-...` ID of a saved Portkey config, not the human-readable slug. Run `python scripts/list_portkey_configs.py` to list yours.
+
+### 3. Run data ingestion
+
+Parses all documents in `DATA/`, chunks them, saves metadata to `processed_data/`, and indexes vectors into Qdrant.
+
+```powershell
+python -m app.ingestion.processor DATA --wipe
+```
+
+> Pass `--wipe` to drop and recreate the Qdrant collection. Omit it to append to an existing collection. The processor probes the embedding model and creates the collection with the correct dimension (1024, cosine) automatically.
+
+### 4. Launch the app
+
+The `/query` endpoint runs the LangGraph pipeline synchronously. You only need the FastAPI server and (optionally) the Streamlit UI. Redis and Postgres are managed by Upstash and Neon; no local persistence services are required.
+
+> **Tip:** Verify all external connections before starting the server:
+> ```bash
+> python -m app.services.health.connection_checker
+> ```
+
+```powershell
+# Terminal 1 — FastAPI backend
+uvicorn app.main:app --reload --port 8000
+
+# Terminal 2 — Streamlit UI
+streamlit run ui/app.py
+```
+
+### 5. Query the API
+
+```powershell
+curl -X POST "http://localhost:8000/query" `
+  -H "Content-Type: application/json" `
+  -d '{"q": "How do I start Redis for a Kubernetes work queue?", "thread_id": "user-1"}'
+
+# Response: {"question": "...", "answer": "...", "thought_process": [...], "status": "...", "sources": [...]}
+```
+
+### 6. Run the eval suite
+
+```powershell
+# Headless CLI runner (requires backend on :8000)
+python -m evals.run_evals
+
+# Or use the Streamlit demo
+streamlit run evals/app.py
+```
+
+### 7. Run tests locally
+
+```powershell
+# Lint + format checks
+ruff check app tests evals
+ruff format --check app tests evals
+
+# Unit tests
+$env:LOGFIRE_IGNORE_NO_CONFIG=1
+pytest tests/
+```
+
+---
+
+## Run with Docker
+
+`docker-compose.yml` brings up the API, the Streamlit UI, and a local Qdrant instance — the fastest way to validate the exact production image before deploying.
 
 ```bash
-curl -X POST http://localhost:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{"q": "How do I run a CronJob every five minutes?", "thread_id": "demo"}'
+docker compose up --build
+
+# API    → http://localhost:8000
+# UI     → http://localhost:8501
+# Qdrant → http://localhost:6333
 ```
 
-```json
-{
-  "question": "How do I run a CronJob every five minutes?",
-  "answer": "...",
-  "thought_process": ["Intent: Technical", "Search Term: ...", "Context Retrieved"],
-  "status": "Response generated.",
-  "sources": ["CONTENT: ...", "CONTENT: ..."]
-}
+Both `api` and `ui` are built from the same `Dockerfile` and read secrets from your `.env`. To point the stack at the local Qdrant container instead of Qdrant Cloud, override `QDRANT_URL=http://qdrant:6333` in the `api` service environment.
+
+Build and run the production image on its own:
+
+```bash
+docker build -t enterprise-rag:local .
+docker run --rm -p 8080:8080 --env-file .env enterprise-rag:local
 ```
 
-Use the same `thread_id` again and the agent remembers the conversation.
+**Image hardening**
 
-## 🧰 Tech stack
+- `python:3.11-slim-bookworm` base with OS packages patched at build time
+- Dependencies installed with [`uv`](https://github.com/astral-sh/uv) in a cached layer, split from the source copy so code-only changes never re-resolve dependencies
+- Runs as a non-root `appuser`
+- Exposes `:8080` with `--timeout-graceful-shutdown 5` for clean ECS draining
 
-| | Tool | Why it is here |
+---
+
+## Production Deployment — AWS ECS Fargate
+
+Full step-by-step provisioning commands live in **[`aws.md`](aws.md)**; the design rationale and alternatives live in **[`deployment_plan.md`](deployment_plan.md)**. This section is the overview.
+
+### Services
+
+| Service | Container command | CPU / Memory | Scaling | Responsibility |
+|---|---|---|---|---|
+| **rag-api** | `uvicorn app.main:app --host 0.0.0.0 --port 8080` | 1024 / 2048 | min 2, max 10 | Public HTTP API and synchronous RAG execution |
+| **rag-ui** | `streamlit run ui/app.py --server.port 8501` | 512 / 1024 | min 1, max 4 | End-user chat interface |
+
+### Managed dependencies
+
+| Component | Service | Purpose |
 |---|---|---|
-| ⚡ API | **FastAPI** + Uvicorn | typed request models, and interactive docs for free |
-| 🧠 Agents | **LangGraph** | a state graph with a conditional route (planner → retriever or responder) and a checkpointer for memory per thread |
-| 🛡️ Safety | **NVIDIA NeMo Guardrails** | Colang rules for jailbreaks, off-topic requests and small talk, checked before any retrieval |
-| 🔀 Gateway | **Portkey** | fallback, retries, caching and request metadata, all as configuration |
-| 🦙 Models | **Llama 3.3 70B / 3.1 8B on Groq** | fast inference, with a smaller model as the fallback |
-| 🗄️ Search | **Qdrant** + **FlashRank** | dense search, then a local ONNX cross-encoder reranker |
-| 🧬 Embeddings | **Gemini** + **sentence-transformers** | a strong hosted model, with a local fallback |
-| 📄 Parsing | pypdf, pdfplumber, BeautifulSoup, python-docx, python-pptx | one loader per format |
-| 📈 Tracing | **Logfire** + **LangSmith** | a span for every step, from the UI click to the model call |
-| 🧪 Evals | **RAGAS** + Streamlit | standard RAG metrics, run against the live API |
+| Vectors | Qdrant Cloud | Retrieval index (`enterprise_rag`, 1024-dim, cosine) |
+| Postgres | Neon | LangGraph checkpointer / conversation memory |
+| Redis | Upstash | FastAPI rate-limit store |
+| Secrets | AWS Secrets Manager | API keys, DB URIs, Redis token |
+| Ingress | Application Load Balancer | Public access to `rag-api` and `rag-ui` |
+| Logs | CloudWatch Logs | `/ecs/rag-api`, `/ecs/rag-ui` |
 
-## 🗂️ Project layout
+Keeping all state in managed services means no EFS volumes, no sticky tasks, and no data loss on scale-in.
 
+### Networking
+
+- VPC across **2 Availability Zones** with public and private subnets.
+- **Public subnets:** ALB + NAT Gateway.
+- **Private subnets:** Fargate tasks only. Outbound traffic to Neon, Upstash, Qdrant Cloud, and the LLM APIs goes through NAT.
+
+| Security group | Inbound | Outbound |
+|---|---|---|
+| `alb-sg` | 80/443 from the internet | `api-sg`, `ui-sg` |
+| `api-sg` | 8080 from `alb-sg` | Internet (Neon, Upstash, Qdrant, LLM APIs) |
+| `ui-sg` | 8501 from `alb-sg` | `api-sg` on 8080 |
+
+ALB listener rules forward `/ui*` to the UI target group and everything else to the API target group.
+
+### Configuration
+
+Sensitive values are stored in **AWS Secrets Manager** and injected into the task definitions as `secrets`; non-sensitive values are plain `environment` entries.
+
+**Secrets Manager** — `NEON_DB_URL`, `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`, `QDRANT_URL`, `QDRANT_API_KEY`, `OPENAI_API_KEY`, `JINA_API_KEY`, `PORTKEY_API_KEY`, `RAG_API_KEY`, `LOGFIRE_TOKEN`, `LANGSMITH_API_KEY`
+
+**Plain environment** — `QDRANT_COLLECTION=enterprise_rag`, `RATE_LIMIT_PER_MINUTE=60`, `PORTKEY_PRIMARY_CONFIG_ID`, `PORTKEY_PRIMARY_SLUG`, `PORTKEY_FALLBACK_SLUG`, `STRICT_STARTUP`, `PYTHONUNBUFFERED=1`
+
+> `STRICT_STARTUP=true` makes the API refuse to boot if any external dependency is unreachable — use it in production, and `false` locally.
+
+Task definition templates live in `.aws/task-definitions/` with `<PLACEHOLDER>` tokens for the image URI, region, backend URL, and every secret ARN. They are rendered at deploy time by the CD workflow, or locally by `scripts/render_task_defs.py`.
+
+### Auto-scaling
+
+`rag-api` uses target-tracking policies on:
+
+- ALB **request count per target** > 1000
+- **CPU utilization** > 70%
+- **Memory utilization** > 70%
+
+`rag-ui` scales on request count or CPU between 1 and 4 tasks (or stays fixed at 1 if internal-only).
+
+### CI/CD Pipeline
+
+```mermaid
+graph LR
+    Push[git push<br/>main / deployment] --> CI[CI workflow<br/>ruff + pytest]
+    CI -->|success| CD[CD workflow]
+    CD --> Build[docker build<br/>tag: git-sha + latest]
+    Build --> ECR[(Amazon ECR)]
+    ECR --> Render[Render task definitions<br/>inject image URI + secret ARNs]
+    Render --> DeployA[ECS deploy rag-api]
+    Render --> DeployU[ECS deploy rag-ui]
+    DeployA --> Stable[Wait for service stability]
+    DeployU --> Stable
 ```
-app/
-├── main.py                 FastAPI: /, /graph, /query, guardrails gate
-├── config.py               settings from .env
-├── agents/
-│   ├── graph.py            the LangGraph workflow and its memory
-│   ├── state.py            the shared agent state
-│   └── nodes/              planner.py · retriever.py · responder.py
-├── guradrails/             NeMo rails setup and Colang rules
-├── gateway/client.py       Portkey fallback, retry and cache config
-├── ingestion/              processor.py, loaders/ (pdf, html, text, office), chunking/
-└── services/retrieval/     embedding.py · qdrant_service.py · ranking_service.py
-ui/app.py                   Streamlit chat with reasoning steps and sources
-evals/                      golden dataset, live pipeline, RAGAS metrics, guardrail tests, dashboard
-DATA/                       true_data (Kubernetes docs) and noisy_data (distractors)
+
+- **`.github/workflows/ci.yml`** — runs on pushes and PRs to `main`, `features`, `deployment`: `ruff check`, `ruff format --check`, then `pytest tests/` with dummy credentials.
+- **`.github/workflows/cd.yml`** — triggered by a **successful CI run** on `main` or `deployment`. Logs in to ECR, builds and pushes the image tagged with the commit SHA and `latest`, renders the task definitions, then deploys `rag-api` and `rag-ui` and waits for each service to stabilize.
+
+#### Required GitHub Actions secrets
+
+Set under **Settings → Secrets and variables → Actions**.
+
+| Secret | Description |
+|---|---|
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | IAM credentials with ECS, ECR, and Secrets Manager access |
+| `AWS_REGION` | Target region (e.g. `us-east-1`) |
+| `ECR_REPOSITORY` | ECR repository name (default `enterprise-rag`) |
+| `ECS_CLUSTER` | ECS cluster name (default `rag-cluster`) |
+| `ECS_SERVICE_API` / `ECS_SERVICE_UI` | ECS service names (default `rag-api` / `rag-ui`) |
+| `BACKEND_URL` | API URL injected into the UI task |
+| `NEON_DB_URL_ARN` | Secrets Manager ARN for `NEON_DB_URL` |
+| `UPSTASH_REDIS_REST_URL_ARN` | Secrets Manager ARN for `UPSTASH_REDIS_REST_URL` |
+| `UPSTASH_REDIS_REST_TOKEN_ARN` | Secrets Manager ARN for `UPSTASH_REDIS_REST_TOKEN` |
+| `QDRANT_URL_ARN` | Secrets Manager ARN for `QDRANT_URL` |
+| `QDRANT_API_KEY_ARN` | Secrets Manager ARN for `QDRANT_API_KEY` |
+| `OPENAI_API_KEY_ARN` | Secrets Manager ARN for `OPENAI_API_KEY` |
+| `JINA_API_KEY_ARN` | Secrets Manager ARN for `JINA_API_KEY` |
+| `PORTKEY_API_KEY_ARN` | Secrets Manager ARN for `PORTKEY_API_KEY` |
+| `RAG_API_KEY_ARN` | Secrets Manager ARN for `RAG_API_KEY` |
+| `LOGFIRE_TOKEN_ARN` | Secrets Manager ARN for `LOGFIRE_TOKEN` |
+| `LANGSMITH_API_KEY_ARN` | Secrets Manager ARN for `LANGSMITH_API_KEY` |
+
+### Deployment sequence
+
+1. Create the VPC, subnets, IGW, NAT Gateway, route tables, and security groups.
+2. Provision Neon Postgres, Upstash Redis, and a Qdrant Cloud cluster; collect the connection strings.
+3. Create the ECR repository (with a keep-last-30-images lifecycle policy) and the CloudWatch log groups.
+4. Push secrets to Secrets Manager — `python scripts/create_aws_secrets.py` reads them straight from your `.env`.
+5. Create `ecsTaskExecutionRole` plus the `rag-api-task-role` / `rag-ui-task-role` task roles and the read-secrets policy.
+6. Create the ECS cluster and register both task definitions.
+7. Create the ALB, target groups, and listener rules.
+8. Create the ECS services and attach the auto-scaling policies.
+9. Store the GitHub Actions secrets and push to `main` or `deployment` to trigger CI → CD.
+10. Validate the endpoints, then run the ingestion job.
+
+Every command for these steps is in **[`aws.md`](aws.md)**.
+
+### Helper scripts
+
+| Script | Purpose |
+|---|---|
+| `scripts/aws_deploy_env.sh` | Shared region / naming / CIDR variables sourced by the other scripts |
+| `scripts/aws_deploy_state.sh` | Records the IDs of provisioned resources (VPC, subnets, ALB, target groups, task defs) |
+| `scripts/create_aws_secrets.py` | Creates Secrets Manager entries from the local `.env` |
+| `scripts/aws_secret_arns.sh` | Exports the resulting secret ARNs for task-definition rendering |
+| `scripts/render_task_defs.py` | Renders `.aws/task-definitions/*.json` locally using `.env` + secret ARNs |
+| `scripts/list_portkey_configs.py` | Lists Portkey saved configs so you can find the `pc-...` config ID |
+| `scripts/locustfile.py` | Locust load-test scenario against the deployed ALB endpoint |
+| `scripts/destroy_aws_deployment.sh` | Full teardown in dependency-safe order |
+
+### Validate the deployment
+
+```bash
+export API_URL="http://<your-alb-dns-name>"
+
+curl -s "${API_URL}/health"
+curl -s "${API_URL}/ready"
+
+curl -s -X POST "${API_URL}/query" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <your-production-api-key>" \
+  -d '{"q":"What is a Kubernetes pod?","thread_id":"aws-test"}'
+
+# Streamlit UI
+echo "Open ${API_URL}/ui"
 ```
 
-## 🛣️ Roadmap
+Tail the logs and watch service health:
 
-- [ ] Keep conversation memory across restarts (a SQLite or Postgres checkpointer instead of the in-memory one)
-- [ ] Hybrid search: BM25 keywords together with dense vectors, merged with rank fusion
-- [ ] Make the guardrail gate fail closed if the rails did not start
-- [ ] Unit tests and CI that run the golden dataset on every change
-- [ ] A semantic cache (Portkey Enterprise) instead of the exact-match cache
-- [ ] Return source file names with each chunk in the API response
+```bash
+aws logs tail /ecs/rag-api --follow
+aws ecs describe-services --cluster rag-cluster --services rag-api rag-ui
+```
 
-## 📄 License
+### Ingestion in production
 
-Apache 2.0. See [LICENSE](LICENSE).
+Do **not** run ingestion as a long-running ECS service. Use one of:
 
-<div align="center"><sub>Built to show what it takes to move a RAG demo to production: guard it, plan it, trace it and measure it.</sub></div>
+1. **Fargate one-off task** — `ecs run-task` with `python -m app.ingestion.processor s3://bucket/data --wipe`.
+2. **AWS Batch** — for large or scheduled ingestion jobs.
+3. **GitHub Actions** — a post-deploy step for small, static datasets.
+
+When sourcing from S3, download the files into the task's ephemeral storage before running the processor.
+
+### Monitoring & alerting
+
+- **CloudWatch Logs** — every service logs to `/ecs/<service>`.
+- **CloudWatch Alarms** — `rag-api` 5xx error rate > 1%.
+- **Prometheus** — scrape `/metrics` on `rag-api` (Amazon Managed Prometheus or a sidecar).
+- **Dashboard metrics** — `/query` p50/p95 latency, guardrails block rate, answer token count.
+- **Logfire + LangSmith** — distributed tracing and per-node agent traces, unchanged from local.
+
+### Load testing
+
+```bash
+pip install locust
+locust -f scripts/locustfile.py --headless -u 50 -r 5 -t 10m \
+  --host http://<your-alb-dns-name>
+```
+
+### Cost & operational notes
+
+- Fargate is simple to operate but costs more per vCPU than EC2 — consider EC2-backed ECS or EKS for sustained high throughput.
+- The NAT Gateway is a fixed hourly cost; it is required for tasks in private subnets to reach the managed services.
+- Neon, Upstash, and Qdrant Cloud are usage-priced and remove all database operations overhead.
+- Keep `requirements-prod.txt` lean — `streamlit`, `ragas`, `sentence-transformers`, and `deepeval` do not belong in the API image unless needed.
+- The Qdrant collection must be 1024-dimensional with cosine distance to match `jina-embeddings-v3`.
+
+### Teardown
+
+```bash
+bash scripts/destroy_aws_deployment.sh
+```
+
+This removes, in dependency order: auto-scaling targets, ECS services and cluster, task definitions, ALB/listeners/target groups, ECR repository, Secrets Manager entries, IAM roles and policies, CloudWatch log groups, NAT Gateway and Elastic IP, and finally the route tables, subnets, IGW, and VPC. Section 19 of [`aws.md`](aws.md) has the equivalent manual commands.
+
+---
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | System architecture, agent graph, ingestion and eval diagrams |
+| [`deployment_plan.md`](deployment_plan.md) | AWS deployment design, trade-offs, task definitions, alternatives |
+| [`aws.md`](aws.md) | Complete AWS provisioning runbook — every CLI command, in order |
+| [`local_testing.md`](local_testing.md) | Local environment setup, ingestion, and feature-by-feature testing |
+| [`TESTING.md`](TESTING.md) | Endpoint, guardrails, auth, rate-limit, metrics, and eval test guide |
+
+---
+
+*Built for High-Scale Enterprise Document Intelligence.*
