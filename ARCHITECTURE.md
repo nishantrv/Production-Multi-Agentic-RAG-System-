@@ -38,7 +38,7 @@ graph LR
         direction TB
         PK["🔀 Portkey\nUnified Gateway"]
         G1["🤖 OpenAI Primary\ngpt-5-mini · via Portkey"]
-        G2["🤖 Anthropic Fallback\nclaude-haiku-4-5 · via Portkey"]
+        G2["🤖 Anthropic Fallback\nvia Portkey"]
     end
 
     %% ── Ingestion ────────────────────────────────────────────────────────────
@@ -152,7 +152,7 @@ graph TB
         FR["⚡ Jina Reranker\nAPI · jina-reranker-v3"]
         PK["🔀 Portkey Gateway\nRouting + Fallback"]
         G1["🤖 OpenAI Primary\ngpt-5-mini · via Portkey"]
-        G2["🤖 Anthropic Fallback\nclaude-haiku-4-5 · via Portkey"]
+        G2["🤖 Anthropic Fallback\nvia Portkey"]
     end
 
     subgraph INGEST ["5. Data Ingestion"]

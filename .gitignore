@@ -50,8 +50,6 @@ commands.md
 
 tenvv
 
-# Claude Code memory & session data
-.claude/
 
 # Logs
 *.log
